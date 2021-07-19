@@ -100,17 +100,17 @@ func _itimediff(later, earlier uint32) int32 {
 
 // segment defines a KCP segment
 type segment struct {
-	conv     uint32
-	cmd      uint8
-	frg      uint8
-	wnd      uint16
-	ts       uint32
-	sn       uint32
-	una      uint32
-	rto      uint32
-	xmit     uint32
-	resendts uint32
-	fastack  uint32
+	conv     uint32//会话ID
+	cmd      uint8//命令ID
+	frg      uint8//用户数据可能会被分成多个KCP包发送，frag标识segment分片ID（在message中的索引，由大到小，0表示最后一个分片）
+	wnd      uint16//剩余接收窗口大小（接收窗口大小-接收队列大小），发送方的发送窗口不能超过接收方给出的数值。
+	ts       uint32//segment发送时刻的时间戳
+	sn       uint32//segment的序号，按1累次递增
+	una      uint32//待接收消息序号(接收滑动窗口左端)。对于未丢包的网络来说，una是下一个可接收的序号，如收到sn=10的包，una为11
+	rto      uint32//该分片的超时重传等待时间，其计算方法同TCP
+	xmit     uint32//发送分片的次数，每发送一次加一。发送的次数对RTO的计算有影响，但是比TCP来说，影响会小一些，计算思想类似
+	resendts uint32//下次超时重传的时间戳
+	fastack  uint32//收到ack时计算的该分片被跳过的累计次数，此字段用于快速重传，自定义需要几次确认开始快速重传
 	acked    uint32 // mark if the seg has acked
 	data     []byte
 }
@@ -131,34 +131,45 @@ func (seg *segment) encode(ptr []byte) []byte {
 
 // KCP defines a single KCP connection
 type KCP struct {
-	conv, mtu, mss, state                  uint32
-	snd_una, snd_nxt, rcv_nxt              uint32
-	ssthresh                               uint32
-	rx_rttvar, rx_srtt                     int32
-	rx_rto, rx_minrto                      uint32
-	snd_wnd, rcv_wnd, rmt_wnd, cwnd, probe uint32
-	interval, ts_flush                     uint32
-	nodelay, updated                       uint32
-	ts_probe, probe_wait                   uint32
-	dead_link, incr                        uint32
+	conv, mtu, mss, state                  uint32//mss：最大分片大小，不大于mtu；state：连接状态（0xFFFFFFFF表示断开连接）
+	snd_una                                uint32//snd_una：下一个待确认的包；
+	snd_nxt                                uint32//snd_nxt：下一个待分配的包的序号；
+	rcv_nxt                                uint32//rcv_nxt：待接收消息序号。为了保证包的顺序，接收方会维护一个接收窗口，接收窗口有一个起始序号rcv_nxt（待接收消息序号）以及尾序号 rcv_nxt + rcv_wnd（接收窗口大小）；
+	ssthresh                               uint32//ssthresh：拥塞窗口阈值，以包为单位（TCP以字节为单位）
+	rx_rttvar                              uint32//rx_rttval：RTT的变化量，代表连接的抖动情况；
+	rx_srtt                                 int32//rx_srtt：smoothed round trip time，平滑后的RTT；
+	rx_rto                                 uint32//rx_rto：由ACK接收延迟计算出来的重传超时时间；
+	rx_minrto                              uint32//rx_minrto：最小重传超时时间；
+	snd_wnd                                uint32//snd_wnd：发送窗口大小；
+	rcv_wnd                                uint32//rcv_wnd：接收窗口大小；
+	rmt_wnd                                uint32//rmt_wnd：远端接收窗口大小；
+	cwnd                                   uint32//cwnd：拥塞窗口大小；
+	probe                                  uint32//probe：探查变量，IKCP_ASK_TELL表示告知远端窗口大小。IKCP_ASK_SEND表示请求远端告知窗口大小；
+	interval                               uint32//interval：内部flush刷新间隔，对系统循环效率有非常重要影响；
+	ts_flush                               uint32//ts_flush：下次flush刷新时间戳；
+	nodelay                                uint32//nodelay：是否启动无延迟模式。无延迟模式rtomin将设置为0，拥塞控制不启动；
+	updated                                uint32//updated：是否调用过update函数的标识；
+	ts_probe                               uint32//ts_probe：下次探查窗口的时间戳；
+	probe_wait                             uint32//probe_wait：探查窗口需要等待的时间；
+	dead_link                              uint32//dead_link：最大重传次数，被认为连接中断；
+        incr                                   uint32//incr：可发送的最大数据量；
+	fastresend                              int32//fastresend：触发快速重传的重复ACK个数；
+	nocwnd                                  int32//nocwnd：取消拥塞控制；
+	stream                                  int32//stream：是否采用流传输模式
+	snd_queue                           []segment//snd_queue：发送消息的队列；
+	rcv_queue                           []segment//rcv_queue：接收消息的队列
+	snd_buf                             []segment//snd_buf：发送消息的缓存；
+	rcv_buf                             []segment//rcv_buf：接收消息的缓存；
 
-	fastresend     int32
-	nocwnd, stream int32
+	acklist                             []ackItem//acklist：待发送的ack列表；
 
-	snd_queue []segment
-	rcv_queue []segment
-	snd_buf   []segment
-	rcv_buf   []segment
-
-	acklist []ackItem
-
-	buffer   []byte
-	reserved int
-	output   output_callback
+	buffer                                []byte//buffer：存储消息字节流；
+	reserved                               int
+	output                                 output_callback//output ：发送消息的回调函数；
 }
 
 type ackItem struct {
-	sn uint32
+	sn uint32//收到的对端的segment sn
 	ts uint32
 }
 
@@ -187,12 +198,14 @@ func NewKCP(conv uint32, output output_callback) *KCP {
 }
 
 // newSegment creates a KCP segment
+// 从sync.Pool申请空间
 func (kcp *KCP) newSegment(size int) (seg segment) {
 	seg.data = xmitBuf.Get().([]byte)[:size]
 	return
 }
 
 // delSegment recycles a KCP segment
+// 向sync.Pool归还空间
 func (kcp *KCP) delSegment(seg *segment) {
 	if seg.data != nil {
 		xmitBuf.Put(seg.data)
@@ -212,22 +225,22 @@ func (kcp *KCP) ReserveBytes(n int) bool {
 	kcp.mss = kcp.mtu - IKCP_OVERHEAD - uint32(n)
 	return true
 }
-
+// 查看recv队列中可读的下一个消息的大小
 // PeekSize checks the size of next message in the recv queue
 func (kcp *KCP) PeekSize() (length int) {
 	if len(kcp.rcv_queue) == 0 {
 		return -1
 	}
-
+        //取第一个seg
 	seg := &kcp.rcv_queue[0]
-	if seg.frg == 0 {
+	if seg.frg == 0 {//如果消息没有分片，就是此seg的data大小
 		return len(seg.data)
 	}
 
 	if len(kcp.rcv_queue) < int(seg.frg+1) {
 		return -1
 	}
-
+        //如果消息有分片，挨个加起来计算总大小
 	for k := range kcp.rcv_queue {
 		seg := &kcp.rcv_queue[k]
 		length += len(seg.data)
@@ -239,11 +252,11 @@ func (kcp *KCP) PeekSize() (length int) {
 }
 
 // Receive data from kcp state machine
-//
+// 从kcp状态机接收数据，返回读到的大小
 // Return number of bytes read.
-//
+// 如果没有数据返回-1
 // Return -1 when there is no readable data.
-//
+// 如果buffer空间小于数据量，返回-2
 // Return -2 if len(buffer) is smaller than kcp.PeekSize().
 func (kcp *KCP) Recv(buffer []byte) (n int) {
 	peeksize := kcp.PeekSize()
@@ -256,31 +269,31 @@ func (kcp *KCP) Recv(buffer []byte) (n int) {
 	}
 
 	var fast_recover bool
-	if len(kcp.rcv_queue) >= int(kcp.rcv_wnd) {
+	if len(kcp.rcv_queue) >= int(kcp.rcv_wnd) {//接收到的队列大于接收窗口
 		fast_recover = true
 	}
 
 	// merge fragment
 	count := 0
-	for k := range kcp.rcv_queue {
+	for k := range kcp.rcv_queue {//挨个读取数据到buffer
 		seg := &kcp.rcv_queue[k]
 		copy(buffer, seg.data)
 		buffer = buffer[len(seg.data):]
 		n += len(seg.data)
 		count++
-		kcp.delSegment(seg)
-		if seg.frg == 0 {
+		kcp.delSegment(seg)//读完归还到sync.Pool
+		if seg.frg == 0 {//frg为0 表示最后一个分片
 			break
 		}
 	}
-	if count > 0 {
+	if count > 0 {//从接收队列删除
 		kcp.rcv_queue = kcp.remove_front(kcp.rcv_queue, count)
 	}
 
 	// move available data from rcv_buf -> rcv_queue
 	count = 0
-	for k := range kcp.rcv_buf {
-		seg := &kcp.rcv_buf[k]
+	for k := range kcp.rcv_buf {//计算 从接收缓存rcv_buf向接收队列rcv_queue 可以移动的数据个数
+		seg := &kcp.rcv_buf[k]//如果seg sn为kcp接收的下一个，并且没有超过接收窗口大小，递增rcv_nxt和count
 		if seg.sn == kcp.rcv_nxt && len(kcp.rcv_queue)+count < int(kcp.rcv_wnd) {
 			kcp.rcv_nxt++
 			count++
@@ -289,21 +302,23 @@ func (kcp *KCP) Recv(buffer []byte) (n int) {
 		}
 	}
 
-	if count > 0 {
+	if count > 0 {//从接收缓存rcv_buf向接收队列rcv_queue移动数据
 		kcp.rcv_queue = append(kcp.rcv_queue, kcp.rcv_buf[:count]...)
 		kcp.rcv_buf = kcp.remove_front(kcp.rcv_buf, count)
 	}
 
 	// fast recover
+	// 快恢复
 	if len(kcp.rcv_queue) < int(kcp.rcv_wnd) && fast_recover {
 		// ready to send back IKCP_CMD_WINS in ikcp_flush
-		// tell remote my window size
+		// tell remote my window size 告诉对面 窗口大小
 		kcp.probe |= IKCP_ASK_TELL
 	}
 	return
 }
 
 // Send is user/upper level send, returns below zero for error
+// 用户层 Send接口，返回值小于0 为报错
 func (kcp *KCP) Send(buffer []byte) int {
 	var count int
 	if len(buffer) == 0 {
@@ -311,11 +326,11 @@ func (kcp *KCP) Send(buffer []byte) int {
 	}
 
 	// append to previous segment in streaming mode (if possible)
-	if kcp.stream != 0 {
+	if kcp.stream != 0 {//流模式下，追加到之前的seg后面
 		n := len(kcp.snd_queue)
 		if n > 0 {
-			seg := &kcp.snd_queue[n-1]
-			if len(seg.data) < int(kcp.mss) {
+			seg := &kcp.snd_queue[n-1]//找到最后一个
+			if len(seg.data) < int(kcp.mss) {//如果最后一个seg的data未塞满
 				capacity := int(kcp.mss) - len(seg.data)
 				extend := capacity
 				if len(buffer) < capacity {
@@ -326,7 +341,7 @@ func (kcp *KCP) Send(buffer []byte) int {
 				// be larger than kcp.mss
 				oldlen := len(seg.data)
 				seg.data = seg.data[:oldlen+extend]
-				copy(seg.data[oldlen:], buffer)
+				copy(seg.data[oldlen:], buffer)//拷贝buffer到seg
 				buffer = buffer[extend:]
 			}
 		}
@@ -336,13 +351,13 @@ func (kcp *KCP) Send(buffer []byte) int {
 		}
 	}
 
-	if len(buffer) <= int(kcp.mss) {
+	if len(buffer) <= int(kcp.mss) {//如果buffer小于mss
 		count = 1
 	} else {
-		count = (len(buffer) + int(kcp.mss) - 1) / int(kcp.mss)
+		count = (len(buffer) + int(kcp.mss) - 1) / int(kcp.mss)//如果大于mss，拆分
 	}
 
-	if count > 255 {
+	if count > 255 {//buffer太大
 		return -2
 	}
 
@@ -353,24 +368,24 @@ func (kcp *KCP) Send(buffer []byte) int {
 	for i := 0; i < count; i++ {
 		var size int
 		if len(buffer) > int(kcp.mss) {
-			size = int(kcp.mss)
+			size = int(kcp.mss)//拆分
 		} else {
 			size = len(buffer)
 		}
 		seg := kcp.newSegment(size)
 		copy(seg.data, buffer[:size])
 		if kcp.stream == 0 { // message mode
-			seg.frg = uint8(count - i - 1)
+			seg.frg = uint8(count - i - 1)//消息模式 frg倒排
 		} else { // stream mode
-			seg.frg = 0
+			seg.frg = 0//流模式 frg=0
 		}
-		kcp.snd_queue = append(kcp.snd_queue, seg)
+		kcp.snd_queue = append(kcp.snd_queue, seg)// 追加到发送队列snd_queue
 		buffer = buffer[size:]
 	}
 	return 0
 }
 
-func (kcp *KCP) update_ack(rtt int32) {
+func (kcp *KCP) update_ack(rtt int32) {//更新ack，更新kcp.rx_rto
 	// https://tools.ietf.org/html/rfc6298
 	var rto uint32
 	if kcp.rx_srtt == 0 {
@@ -395,21 +410,22 @@ func (kcp *KCP) update_ack(rtt int32) {
 	kcp.rx_rto = _ibound_(kcp.rx_minrto, rto, IKCP_RTO_MAX)
 }
 
-func (kcp *KCP) shrink_buf() {
+func (kcp *KCP) shrink_buf() {//收缩buf
 	if len(kcp.snd_buf) > 0 {
 		seg := &kcp.snd_buf[0]
-		kcp.snd_una = seg.sn
+		kcp.snd_una = seg.sn//snd_una设为seg的sn
 	} else {
-		kcp.snd_una = kcp.snd_nxt
+		kcp.snd_una = kcp.snd_nxt//snd_una设为snd_nxt
 	}
 }
-
+//收到ack，从发送buf中找出相同sn的包，无需再次发送
 func (kcp *KCP) parse_ack(sn uint32) {
+	//如果sn<下一个待确认的包 或  sn>下一个待发送的包
 	if _itimediff(sn, kcp.snd_una) < 0 || _itimediff(sn, kcp.snd_nxt) >= 0 {
 		return
 	}
 
-	for k := range kcp.snd_buf {
+	for k := range kcp.snd_buf {//发送buf
 		seg := &kcp.snd_buf[k]
 		if sn == seg.sn {
 			// mark and free space, but leave the segment here,
@@ -425,7 +441,7 @@ func (kcp *KCP) parse_ack(sn uint32) {
 		}
 	}
 }
-
+//收到ack，检查发送buf中，找到<=sn的seg，递增seg.fastack快速重传计数
 func (kcp *KCP) parse_fastack(sn, ts uint32) {
 	if _itimediff(sn, kcp.snd_una) < 0 || _itimediff(sn, kcp.snd_nxt) >= 0 {
 		return
@@ -445,22 +461,22 @@ func (kcp *KCP) parse_una(una uint32) int {
 	count := 0
 	for k := range kcp.snd_buf {
 		seg := &kcp.snd_buf[k]
-		if _itimediff(una, seg.sn) > 0 {
-			kcp.delSegment(seg)
+		if _itimediff(una, seg.sn) > 0 {//找到sn比una小的seg
+			kcp.delSegment(seg)//释放空间
 			count++
 		} else {
 			break
 		}
 	}
 	if count > 0 {
-		kcp.snd_buf = kcp.remove_front(kcp.snd_buf, count)
+		kcp.snd_buf = kcp.remove_front(kcp.snd_buf, count)//从发送buf删除
 	}
 	return count
 }
 
 // ack append
 func (kcp *KCP) ack_push(sn, ts uint32) {
-	kcp.acklist = append(kcp.acklist, ackItem{sn, ts})
+	kcp.acklist = append(kcp.acklist, ackItem{sn, ts})//收到PSH数据包，追加ack包
 }
 
 // returns true if data has repeated
