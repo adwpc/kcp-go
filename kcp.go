@@ -152,7 +152,7 @@ type KCP struct {
 	ts_probe                               uint32//ts_probe：下次探查窗口的时间戳；
 	probe_wait                             uint32//probe_wait：探查窗口需要等待的时间；
 	dead_link                              uint32//dead_link：最大重传次数，被认为连接中断；
-        incr                                   uint32//incr：可发送的最大数据量；
+        incr                               uint32//incr：可发送的最大数据量；
 	fastresend                              int32//fastresend：触发快速重传的重复ACK个数；
 	nocwnd                                  int32//nocwnd：取消拥塞控制；
 	stream                                  int32//stream：是否采用流传输模式
@@ -413,7 +413,7 @@ func (kcp *KCP) update_ack(rtt int32) {//更新ack，更新kcp.rx_rto
 func (kcp *KCP) shrink_buf() {//收缩buf
 	if len(kcp.snd_buf) > 0 {
 		seg := &kcp.snd_buf[0]
-		kcp.snd_una = seg.sn//snd_una设为seg的sn
+		kcp.snd_una = seg.sn//snd_una设为snd_buf[0]的sn
 	} else {
 		kcp.snd_una = kcp.snd_nxt//snd_una设为snd_nxt
 	}
@@ -461,7 +461,7 @@ func (kcp *KCP) parse_una(una uint32) int {
 	count := 0
 	for k := range kcp.snd_buf {
 		seg := &kcp.snd_buf[k]
-		if _itimediff(una, seg.sn) > 0 {//找到sn比una小的seg
+		if _itimediff(una, seg.sn) > 0 {//从发送缓冲区，找到sn比una小的seg
 			kcp.delSegment(seg)//释放空间
 			count++
 		} else {
@@ -476,33 +476,33 @@ func (kcp *KCP) parse_una(una uint32) int {
 
 // ack append
 func (kcp *KCP) ack_push(sn, ts uint32) {
-	kcp.acklist = append(kcp.acklist, ackItem{sn, ts})//收到PSH数据包，追加ack包
+	kcp.acklist = append(kcp.acklist, ackItem{sn, ts})//收到PSH数据包，生成ack包，追加到acklist
 }
 
 // returns true if data has repeated
 func (kcp *KCP) parse_data(newseg segment) bool {
 	sn := newseg.sn
-	if _itimediff(sn, kcp.rcv_nxt+kcp.rcv_wnd) >= 0 ||
-		_itimediff(sn, kcp.rcv_nxt) < 0 {
+	if _itimediff(sn, kcp.rcv_nxt+kcp.rcv_wnd) >= 0 || //如果新seg的sn超过了上限（要接收的下一个sn+接收窗口）
+		_itimediff(sn, kcp.rcv_nxt) < 0 { //或者小于要接收的下一个sn，就是重复
 		return true
 	}
 
 	n := len(kcp.rcv_buf) - 1
 	insert_idx := 0
 	repeat := false
-	for i := n; i >= 0; i-- {
+	for i := n; i >= 0; i-- {//倒序查找 sn相同的
 		seg := &kcp.rcv_buf[i]
 		if seg.sn == sn {
-			repeat = true
+			repeat = true//找到即为重复
 			break
 		}
-		if _itimediff(sn, seg.sn) > 0 {
+		if _itimediff(sn, seg.sn) > 0 {//找到插入位置
 			insert_idx = i + 1
 			break
 		}
 	}
 
-	if !repeat {
+	if !repeat {//如果不重复，插入
 		// replicate the content if it's new
 		dataCopy := xmitBuf.Get().([]byte)[:len(newseg.data)]
 		copy(dataCopy, newseg.data)
@@ -521,7 +521,7 @@ func (kcp *KCP) parse_data(newseg segment) bool {
 	count := 0
 	for k := range kcp.rcv_buf {
 		seg := &kcp.rcv_buf[k]
-		if seg.sn == kcp.rcv_nxt && len(kcp.rcv_queue)+count < int(kcp.rcv_wnd) {
+		if seg.sn == kcp.rcv_nxt && len(kcp.rcv_queue)+count < int(kcp.rcv_wnd) {//从rcv_buf，找到sn连续seg的个数，同时保证rcv_queue不会超限
 			kcp.rcv_nxt++
 			count++
 		} else {
@@ -529,7 +529,7 @@ func (kcp *KCP) parse_data(newseg segment) bool {
 		}
 	}
 	if count > 0 {
-		kcp.rcv_queue = append(kcp.rcv_queue, kcp.rcv_buf[:count]...)
+		kcp.rcv_queue = append(kcp.rcv_queue, kcp.rcv_buf[:count]...)//从rcv_buf挪到rcv_queue
 		kcp.rcv_buf = kcp.remove_front(kcp.rcv_buf, count)
 	}
 
@@ -537,10 +537,10 @@ func (kcp *KCP) parse_data(newseg segment) bool {
 }
 
 // Input a packet into kcp state machine.
-//
+// 输入一个包到kcp状态机
 // 'regular' indicates it's a real data packet from remote, and it means it's not generated from ReedSolomon
 // codecs.
-//
+// regular，表示是真实包，不是fec；ackNoDelay，表示是立即发ack
 // 'ackNoDelay' will trigger immediate ACK, but surely it will not be efficient in bandwidth
 func (kcp *KCP) Input(data []byte, regular, ackNoDelay bool) int {
 	snd_una := kcp.snd_una
@@ -562,18 +562,18 @@ func (kcp *KCP) Input(data []byte, regular, ackNoDelay bool) int {
 			break
 		}
 
-		data = ikcp_decode32u(data, &conv)
+		data = ikcp_decode32u(data, &conv)//解析conv 会话号
 		if conv != kcp.conv {
 			return -1
 		}
 
-		data = ikcp_decode8u(data, &cmd)
-		data = ikcp_decode8u(data, &frg)
-		data = ikcp_decode16u(data, &wnd)
-		data = ikcp_decode32u(data, &ts)
-		data = ikcp_decode32u(data, &sn)
-		data = ikcp_decode32u(data, &una)
-		data = ikcp_decode32u(data, &length)
+		data = ikcp_decode8u(data, &cmd)//解析命令
+		data = ikcp_decode8u(data, &frg)//seg分片
+		data = ikcp_decode16u(data, &wnd)//对端窗口
+		data = ikcp_decode32u(data, &ts)//时间戳
+		data = ikcp_decode32u(data, &sn)//序列号
+		data = ikcp_decode32u(data, &una)//希望接收的下一个sn
+		data = ikcp_decode32u(data, &length)//长度
 		if len(data) < int(length) {
 			return -2
 		}
@@ -584,24 +584,24 @@ func (kcp *KCP) Input(data []byte, regular, ackNoDelay bool) int {
 		}
 
 		// only trust window updates from regular packets. i.e: latest update
-		if regular {
+		if regular {//真实包，非fec
 			kcp.rmt_wnd = uint32(wnd)
 		}
-		if kcp.parse_una(una) > 0 {
-			windowSlides = true
+		if kcp.parse_una(una) > 0 {//清理发送snd_buf中比una小的
+			windowSlides = true//窗口滑动
 		}
 		kcp.shrink_buf()
 
 		if cmd == IKCP_CMD_ACK {
-			kcp.parse_ack(sn)
-			kcp.parse_fastack(sn, ts)
+			kcp.parse_ack(sn)//收到ack，从发送buf中找出相同sn的包，无需再次发送
+			kcp.parse_fastack(sn, ts)//收到ack，检查发送buf中，找到<=sn的seg，递增seg.fastack快速重传计数
 			flag |= 1
 			latest = ts
 		} else if cmd == IKCP_CMD_PUSH {
 			repeat := true
 			if _itimediff(sn, kcp.rcv_nxt+kcp.rcv_wnd) < 0 {
 				kcp.ack_push(sn, ts)
-				if _itimediff(sn, kcp.rcv_nxt) >= 0 {
+				if _itimediff(sn, kcp.rcv_nxt) >= 0 {//如果sn>=kcp要接收的下一个sn，为重复包
 					var seg segment
 					seg.conv = conv
 					seg.cmd = cmd
@@ -615,7 +615,7 @@ func (kcp *KCP) Input(data []byte, regular, ackNoDelay bool) int {
 				}
 			}
 			if regular && repeat {
-				atomic.AddUint64(&DefaultSnmp.RepeatSegs, 1)
+				atomic.AddUint64(&DefaultSnmp.RepeatSegs, 1)//累计重复次数
 			}
 		} else if cmd == IKCP_CMD_WASK {
 			// ready to send back IKCP_CMD_WINS in Ikcp_flush
@@ -637,12 +637,12 @@ func (kcp *KCP) Input(data []byte, regular, ackNoDelay bool) int {
 	if flag != 0 && regular {
 		current := currentMs()
 		if _itimediff(current, latest) >= 0 {
-			kcp.update_ack(_itimediff(current, latest))
+			kcp.update_ack(_itimediff(current, latest))//更新rto
 		}
 	}
 
 	// cwnd update when packet arrived
-	if kcp.nocwnd == 0 {
+	if kcp.nocwnd == 0 {//如果开启了拥塞控制
 		if _itimediff(kcp.snd_una, snd_una) > 0 {
 			if kcp.cwnd < kcp.rmt_wnd {
 				mss := kcp.mss
@@ -671,8 +671,8 @@ func (kcp *KCP) Input(data []byte, regular, ackNoDelay bool) int {
 	}
 
 	if windowSlides { // if window has slided, flush
-		kcp.flush(false)
-	} else if ackNoDelay && len(kcp.acklist) > 0 { // ack immediately
+		kcp.flush(false)//如果窗口滑动，发送
+	} else if ackNoDelay && len(kcp.acklist) > 0 { // ack immediately 如果开启ackNoDelay并且有ack，立即发送
 		kcp.flush(true)
 	}
 	return 0
@@ -705,7 +705,7 @@ func (kcp *KCP) flush(ackOnly bool) uint32 {
 		}
 	}
 
-	// flush bytes in buffer if there is any
+	// flush bytes in buffer if there is any 发送残留数据
 	flushBuffer := func() {
 		size := len(buffer) - len(ptr)
 		if size > kcp.reserved {
@@ -713,10 +713,11 @@ func (kcp *KCP) flush(ackOnly bool) uint32 {
 		}
 	}
 
-	// flush acknowledges
+	// flush acknowledges 发送ack
 	for i, ack := range kcp.acklist {
 		makeSpace(IKCP_OVERHEAD)
-		// filter jitters caused by bufferbloat
+		// filter jitters caused by bufferbloat 路由器缓存导致rtt周期性抖动
+		// ack的sn >= 要收的下一个sn 或  acklist的最后一个，编码ack包
 		if _itimediff(ack.sn, kcp.rcv_nxt) >= 0 || len(kcp.acklist)-1 == i {
 			seg.sn, seg.ts = ack.sn, ack.ts
 			ptr = seg.encode(ptr)
@@ -730,7 +731,7 @@ func (kcp *KCP) flush(ackOnly bool) uint32 {
 	}
 
 	// probe window size (if remote window size equals zero)
-	if kcp.rmt_wnd == 0 {
+	if kcp.rmt_wnd == 0 {//如果对端窗口为0，探测窗口大小
 		current := currentMs()
 		if kcp.probe_wait == 0 {
 			kcp.probe_wait = IKCP_PROBE_INIT
@@ -769,7 +770,7 @@ func (kcp *KCP) flush(ackOnly bool) uint32 {
 
 	kcp.probe = 0
 
-	// calculate window size
+	// calculate window size 计算窗口
 	cwnd := _imin_(kcp.snd_wnd, kcp.rmt_wnd)
 	if kcp.nocwnd == 0 {
 		cwnd = _imin_(kcp.cwnd, cwnd)
@@ -777,7 +778,7 @@ func (kcp *KCP) flush(ackOnly bool) uint32 {
 
 	// sliding window, controlled by snd_nxt && sna_una+cwnd
 	newSegsCount := 0
-	for k := range kcp.snd_queue {
+	for k := range kcp.snd_queue {//从snd_queue移动seg到snd_buf,直到 达到窗口上限
 		if _itimediff(kcp.snd_nxt, kcp.snd_una+cwnd) >= 0 {
 			break
 		}
@@ -790,11 +791,11 @@ func (kcp *KCP) flush(ackOnly bool) uint32 {
 		newSegsCount++
 	}
 	if newSegsCount > 0 {
-		kcp.snd_queue = kcp.remove_front(kcp.snd_queue, newSegsCount)
+		kcp.snd_queue = kcp.remove_front(kcp.snd_queue, newSegsCount)//从snd_queue删除发送的seg
 	}
 
 	// calculate resent
-	resent := uint32(kcp.fastresend)
+	resent := uint32(kcp.fastresend)//快速重传计数
 	if kcp.fastresend <= 0 {
 		resent = 0xffffffff
 	}
