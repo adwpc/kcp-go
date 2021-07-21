@@ -771,8 +771,8 @@ func (kcp *KCP) flush(ackOnly bool) uint32 {
 	kcp.probe = 0
 
 	// calculate window size 计算窗口
-	cwnd := _imin_(kcp.snd_wnd, kcp.rmt_wnd)
-	if kcp.nocwnd == 0 {
+	cwnd := _imin_(kcp.snd_wnd, kcp.rmt_wnd)//发送窗口和对端窗口，选个小的作为窗口
+	if kcp.nocwnd == 0 {//如果开启拥塞，再和拥塞窗口比较下，选择小的
 		cwnd = _imin_(kcp.cwnd, cwnd)
 	}
 
@@ -809,14 +809,14 @@ func (kcp *KCP) flush(ackOnly bool) uint32 {
 	for k := range ref {
 		segment := &ref[k]
 		needsend := false
-		if segment.acked == 1 {
+		if segment.acked == 1 {//跳过已经ack过的
 			continue
 		}
-		if segment.xmit == 0 { // initial transmit
+		if segment.xmit == 0 { // initial transmit 如果未发送过，初始化
 			needsend = true
 			segment.rto = kcp.rx_rto
-			segment.resendts = current + segment.rto
-		} else if segment.fastack >= resent { // fast retransmit
+			segment.resendts = current + segment.rto//重传时间戳=当前时间+rto
+		} else if segment.fastack >= resent { // fast retransmit 快速重传
 			needsend = true
 			segment.fastack = 0
 			segment.rto = kcp.rx_rto
@@ -830,7 +830,7 @@ func (kcp *KCP) flush(ackOnly bool) uint32 {
 			segment.resendts = current + segment.rto
 			change++
 			earlyRetransSegs++
-		} else if _itimediff(current, segment.resendts) >= 0 { // RTO
+		} else if _itimediff(current, segment.resendts) >= 0 { // RTO 超过rto
 			needsend = true
 			if kcp.nodelay == 0 {
 				segment.rto += kcp.rx_rto
@@ -855,26 +855,27 @@ func (kcp *KCP) flush(ackOnly bool) uint32 {
 			copy(ptr, segment.data)
 			ptr = ptr[len(segment.data):]
 
-			if segment.xmit >= kcp.dead_link {
+			if segment.xmit >= kcp.dead_link {//检查是否死链
 				kcp.state = 0xFFFFFFFF
 			}
 		}
 
-		// get the nearest rto
+		// get the nearest rto 计算最近的rto
 		if rto := _itimediff(segment.resendts, current); rto > 0 && rto < minrto {
 			minrto = rto
 		}
 	}
 
-	// flash remain segments
+	// flush remain segments
+	// 写入残留数据
 	flushBuffer()
 
 	// counter updates
 	sum := lostSegs
-	if lostSegs > 0 {
+	if lostSegs > 0 {//更新丢失seg计数
 		atomic.AddUint64(&DefaultSnmp.LostSegs, lostSegs)
 	}
-	if fastRetransSegs > 0 {
+	if fastRetransSegs > 0 {//快速重传seg计数
 		atomic.AddUint64(&DefaultSnmp.FastRetransSegs, fastRetransSegs)
 		sum += fastRetransSegs
 	}
@@ -887,7 +888,7 @@ func (kcp *KCP) flush(ackOnly bool) uint32 {
 	}
 
 	// cwnd update
-	if kcp.nocwnd == 0 {
+	if kcp.nocwnd == 0 {//如果开启了拥塞控制
 		// update ssthresh
 		// rate halving, https://tools.ietf.org/html/rfc6937
 		if change > 0 {
@@ -1021,7 +1022,7 @@ func (kcp *KCP) SetMtu(mtu int) int {
 }
 
 // NoDelay options
-// fastest: ikcp_nodelay(kcp, 1, 20, 2, 1)
+// fastest: ikcp_nodelay(kcp, 1, 20, 2, 1)//极速模式：rto=30ms interval=10ms fastresend=2 nocwnd=1
 // nodelay: 0:disable(default), 1:enable
 // interval: internal update timer interval in millisec, default is 100ms
 // resend: 0:disable fast resend(default), 1:enable fast resend
@@ -1030,7 +1031,7 @@ func (kcp *KCP) NoDelay(nodelay, interval, resend, nc int) int {
 	if nodelay >= 0 {
 		kcp.nodelay = uint32(nodelay)
 		if nodelay != 0 {
-			kcp.rx_minrto = IKCP_RTO_NDL
+			kcp.rx_minrto = IKCP_RTO_NDL//30ms
 		} else {
 			kcp.rx_minrto = IKCP_RTO_MIN
 		}
